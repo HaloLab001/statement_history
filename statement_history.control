@@ -1,0 +1,5 @@
+# statement_history extension
+comment = 'track planning and execution statistics and other performance related info of all SQL statements executed'
+default_version = '1.0'
+module_pathname = '$libdir/statement_history'
+relocatable = true
