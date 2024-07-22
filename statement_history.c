@@ -55,7 +55,17 @@ PG_MODULE_MAGIC;
 void
 _PG_init(void)
 {
-    /* Enable compute query id if not enabled */
+    /* 
+     * As we store the statement trace data in process local memory,
+     * we needn't create shared memory area. So here is free to
+     * check process_shared_preload_libraries_in_progress.
+     */
+
+
+    /*
+	 * Inform the postmaster that we want to enable query_id calculation if
+	 * compute_query_id is set to auto.
+	 */
     EnableQueryId();
 
 

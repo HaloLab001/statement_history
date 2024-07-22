@@ -48,7 +48,67 @@
 #ifndef STMT_HIST_H
 #define STMT_HIST_H
 
+#include "datatype/timestamp.h"
+
 extern void _PG_init(void);         /* module load callback */
 
+
+typedef struct SHDataInternalData
+{
+    Oid                 datid;
+    Oid                 userid;
+    Oid                 nspid;
+
+    /* client info attributes */
+    char                application_name[NAMEDATALEN];
+    char                *client_addr;
+    int16               client_port;
+
+    /* query info attributes */
+    char                *query_string;
+    uint64              queryid;
+    TimestampTz         start_time;
+    TimestampTz         finish_time;
+    int32               processid;
+    uint64              n_soft_parse;
+    uint64              n_hard_parse;
+    char                *query_plan;
+
+    /* query result info attributes */
+    uint64              n_returned_rows;
+    uint64              n_tuples_fetched;
+    uint64              n_tuples_returned;
+    uint64              n_tuples_inserted;
+    uint64              n_tuples_updated;
+    uint64              n_tuples_deleted;
+    uint64              n_blocks_fetched;
+    uint64              n_blocks_hit;
+
+    /* execution info attributes */
+    uint64              db_time;
+    uint64              cpu_time;
+    uint64              io_time;
+    uint64              parse_time;
+    uint64              rewrite_time;
+    uint64              plan_time;
+    uint64              exec_time;
+
+    /* lock info attribtes */
+    uint64              lock_count;
+    uint64              lock_time;
+    uint64              lock_wait_count;
+    uint64              lock_wait_time;
+    uint64              lock_max_count;
+    uint64              lwlock_count;
+    uint64              lwlock_wait_count;
+    uint64              lwlock_time;
+    uint64              lwlock_wait_time;
+    char                *wait_event;
+
+    /* other info */
+    bool                is_slow_sql;
+} SHDataInternalData;
+
+typedef SHDataInternalData  *SHDataInternal;
 
 #endif							/* STMT_HIST_H */
