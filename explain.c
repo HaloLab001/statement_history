@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * statement_history--1.0.sql
- *		Like pg_stat_statements but more.
+ * explain.c
+ *		Output a plan's text format.
  *
  * 
  * 版权所有 (c) 2019-2024, 易景科技保留所有权利。
@@ -41,10 +41,7 @@
  * 
  *
  * IDENTIFICATION
- *	  contrib/statement_history/statement_history--1.0.sql
+ *	  contrib/statement_history/explain.c
  *
  *-------------------------------------------------------------------------
  */
-
-\echo Use "CREATE EXTENSION statement_history" to load this file. \quit
-

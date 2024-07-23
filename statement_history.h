@@ -49,18 +49,73 @@
 #define STMT_HIST_H
 
 #include "datatype/timestamp.h"
+#include "nodes/nodes.h"
+#include "portability/instr_time.h"
 
 extern void _PG_init(void);         /* module load callback */
 
 
-typedef struct SHDataInternalData
+typedef struct SHTimeCalc
 {
+    instr_time  start;
+    instr_time  end;
+} SHTimeCalc;
+
+typedef struct FormData_SHInternal
+{
+#define Anum_stmt_hist_internal_datid 1
+#define Anum_stmt_hist_internal_userid 2
+#define Anum_stmt_hist_internal_nspid 3
+#define Anum_stmt_hist_internal_application_name 4
+#define Anum_stmt_hist_internal_client_addr 5
+#define Anum_stmt_hist_internal_client_port 6
+#define Anum_stmt_hist_internal_query_string 7
+#define Anum_stmt_hist_internal_queryid 8
+#define Anum_stmt_hist_internal_start_time 9
+#define Anum_stmt_hist_internal_finish_time 10
+#define Anum_stmt_hist_internal_processid 11
+#define Anum_stmt_hist_internal_n_soft_parse 12
+#define Anum_stmt_hist_internal_n_hard_parse 13
+#define Anum_stmt_hist_internal_query_plan 14
+#define Anum_stmt_hist_internal_n_returned_rows 15
+#define Anum_stmt_hist_internal_n_tuples_fetched 16
+#define Anum_stmt_hist_internal_n_tuples_returned 17
+#define Anum_stmt_hist_internal_n_tuples_inserted 18
+#define Anum_stmt_hist_internal_n_tuples_updated 19
+#define Anum_stmt_hist_internal_n_tuples_deleted 20
+#define Anum_stmt_hist_internal_n_blocks_fetched 21
+#define Anum_stmt_hist_internal_n_blocks_hit 22
+#define Anum_stmt_hist_internal_db_time 23
+#define Anum_stmt_hist_internal_cpu_time 24
+#define Anum_stmt_hist_internal_io_time 25
+#define Anum_stmt_hist_internal_parse_time 26
+#define Anum_stmt_hist_internal_rewrite_time 27
+#define Anum_stmt_hist_internal_plan_time 28
+#define Anum_stmt_hist_internal_exec_time 29
+#define Anum_stmt_hist_internal_lock_count 30
+#define Anum_stmt_hist_internal_lock_time 31
+#define Anum_stmt_hist_internal_lock_wait_count 32
+#define Anum_stmt_hist_internal_lock_wait_time 33
+#define Anum_stmt_hist_internal_lock_max_count 34
+#define Anum_stmt_hist_internal_lwlock_count 35
+#define Anum_stmt_hist_internal_lwlock_wait_count 36
+#define Anum_stmt_hist_internal_lwlock_time 37
+#define Anum_stmt_hist_internal_lwlock_wait_time 38
+#define Anum_stmt_hist_internal_wait_event 39
+#define Anum_stmt_hist_internal_is_slow_sql 40
+
+#define Natts_stmt_hist_internal 40
+
+    /*
+     * The data fields in statement_history_internal table.
+     */
+
     Oid                 datid;
     Oid                 userid;
     Oid                 nspid;
 
     /* client info attributes */
-    char                application_name[NAMEDATALEN];
+    char                *application_name;
     char                *client_addr;
     int16               client_port;
 
@@ -70,45 +125,57 @@ typedef struct SHDataInternalData
     TimestampTz         start_time;
     TimestampTz         finish_time;
     int32               processid;
-    uint64              n_soft_parse;
-    uint64              n_hard_parse;
+    int64               n_soft_parse;
+    int64               n_hard_parse;
     char                *query_plan;
 
     /* query result info attributes */
-    uint64              n_returned_rows;
-    uint64              n_tuples_fetched;
-    uint64              n_tuples_returned;
-    uint64              n_tuples_inserted;
-    uint64              n_tuples_updated;
-    uint64              n_tuples_deleted;
-    uint64              n_blocks_fetched;
-    uint64              n_blocks_hit;
+    int64               n_returned_rows;
+    int64               n_tuples_fetched;
+    int64               n_tuples_returned;
+    int64               n_tuples_inserted;
+    int64               n_tuples_updated;
+    int64               n_tuples_deleted;
+    int64               n_blocks_fetched;
+    int64               n_blocks_hit;
 
     /* execution info attributes */
-    uint64              db_time;
-    uint64              cpu_time;
-    uint64              io_time;
-    uint64              parse_time;
-    uint64              rewrite_time;
-    uint64              plan_time;
-    uint64              exec_time;
+    int64               db_time;
+    int64               cpu_time;
+    int64               io_time;
+    int64               parse_time;
+    int64               rewrite_time;
+    int64               plan_time;
+    int64               exec_time;
 
     /* lock info attribtes */
-    uint64              lock_count;
-    uint64              lock_time;
-    uint64              lock_wait_count;
-    uint64              lock_wait_time;
-    uint64              lock_max_count;
-    uint64              lwlock_count;
-    uint64              lwlock_wait_count;
-    uint64              lwlock_time;
-    uint64              lwlock_wait_time;
+    int64               lock_count;
+    int64               lock_time;
+    int64               lock_wait_count;
+    int64               lock_wait_time;
+    int64               lock_max_count;
+    int64               lwlock_count;
+    int64               lwlock_wait_count;
+    int64               lwlock_time;
+    int64               lwlock_wait_time;
     char                *wait_event;
 
     /* other info */
     bool                is_slow_sql;
-} SHDataInternalData;
+} FormData_SHInternal;
 
-typedef SHDataInternalData  *SHDataInternal;
+typedef struct SHDataInternalData
+{
+    int                 level;
+
+    struct SHTimeCalc           parse_step;
+    struct SHTimeCalc           rewrite_step;
+    struct SHTimeCalc           plan_step;
+    struct SHTimeCalc           exec_step;
+
+    FormData_SHInternal         fd_shinternal;
+
+    bool                        to_store;
+} SHDataInternalData;
 
 #endif							/* STMT_HIST_H */

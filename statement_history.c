@@ -47,8 +47,69 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "statement_history.h"
 
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/relscan.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_namespace.h"
+#include "executor/executor.h"
+#include "nodes/plannodes.h"
+#include "optimizer/planner.h"
+#include "parser/analyze.h"
+#include "parser/parser.h"
+#include "portability/instr_time.h"
+#include "storage/lockdefs.h"
+#include "utils/backend_status.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/rel.h"
+
+/* GUC parameters*/
+static bool sh_track_utility = true;	/* whether to track utility commands */
+
+static SHDataInternalData   stmt_data;
+static Oid  stmt_hist_internal_rel = InvalidOid;
+
+static pre_parse_hook_type  prev_pre_parse_hook = NULL;
+static post_parse_hook_type prev_post_parse_hook = NULL;
+static pre_parse_analyze_hook_type prev_pre_parse_analyze_hook = NULL;
+static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+static planner_hook_type    prev_planner_hook= NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
+
+
+#define SH_INTERNAL_TABLE   "statement_history_internal"
+#define SH_INTERNAL_TABNS  PG_CATALOG_NAMESPACE
+#define SH_VALID_UTILSTMT(n)		(IsA(n, ExecuteStmt) || IsA(n, PrepareStmt))
+/* hooks */
+static void sh_pre_parse(const char *str, RawParseMode mode);
+static void sh_post_parse(List	*parsetree);
+static void sh_pre_parse_analyze(ParseState *pstate,
+								 RawStmt *parseTree);
+static void sh_post_parse_analyze(ParseState *pstate,
+								  Query *query,
+								  JumbleState *jstate);
+static PlannedStmt *sh_planner(Query *parse,
+                               const char *query_string,
+			                   int cursorOptions,
+			                   ParamListInfo boundParams);
+static void sh_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void sh_ExecutorRun(QueryDesc *queryDesc,
+						   ScanDirection direction,
+						   uint64 count,
+						   bool execute_once);
+static void sh_ExecutorFinish(QueryDesc *queryDesc);
+static void sh_ExecutorEnd(QueryDesc *queryDesc);
+static void sh_writedata(void);
 
 PG_MODULE_MAGIC;
 
@@ -68,5 +129,376 @@ _PG_init(void)
 	 */
     EnableQueryId();
 
+    /*
+     * Define extension's GUC parameters
+     */
+    DefineCustomBoolVariable("statement_history.track_utility",
+							 "Selects whether utility commands are tracked by statement_history.",
+							 NULL,
+							 &sh_track_utility,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
+
+    /*
+     * Setup all necessary hooks
+     */
+    prev_pre_parse_hook = pre_parse_hook;
+    pre_parse_hook = sh_pre_parse;
+    prev_post_parse_hook = post_parse_hook;
+    post_parse_hook = sh_post_parse;
+    prev_pre_parse_analyze_hook = pre_parse_analyze_hook;
+    pre_parse_analyze_hook = sh_pre_parse_analyze;
+    prev_post_parse_analyze_hook = post_parse_analyze_hook;
+    post_parse_analyze_hook = sh_post_parse_analyze;
+    prev_planner_hook = planner_hook;
+    planner_hook = sh_planner;
+    prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = sh_ExecutorStart;
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = sh_ExecutorRun;
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = sh_ExecutorFinish;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = sh_ExecutorEnd;
+}
+
+
+static void 
+sh_pre_parse(const char *str, RawParseMode mode)
+{
+    int len;
+
+    INSTR_TIME_SET_CURRENT(stmt_data.parse_step.start);
+
+    if (prev_pre_parse_hook)
+        prev_pre_parse_hook(str, mode);
+
+    len = strlen(str);
+    stmt_data.fd_shinternal.query_string = (char *) palloc(len + 1);
+    memcpy(stmt_data.fd_shinternal.query_string, str, len);
+    stmt_data.fd_shinternal.query_string[len] = '\0';
+
+}
+
+static void
+sh_post_parse(List	*parsetree)
+{
+    if (prev_post_parse_hook)
+        prev_post_parse_hook(parsetree);
+
+    INSTR_TIME_SET_CURRENT(stmt_data.parse_step.end);
+
+    INSTR_TIME_SUBTRACT(stmt_data.parse_step.end, stmt_data.parse_step.start);
+    stmt_data.fd_shinternal.parse_time = INSTR_TIME_GET_MICROSEC(stmt_data.parse_step.end);
+}
+
+static void
+sh_pre_parse_analyze(ParseState *pstate,
+					 RawStmt *parseTree)
+{
+    INSTR_TIME_SET_CURRENT(stmt_data.rewrite_step.start);
+
+    if (prev_pre_parse_analyze_hook)
+        prev_pre_parse_analyze_hook(pstate, parseTree);
+}
+
+static void
+sh_post_parse_analyze(ParseState *pstate,
+					  Query *query,
+					  JumbleState *jstate)
+{
+    if (prev_post_parse_analyze_hook)
+        prev_post_parse_analyze_hook(pstate, query, jstate);
+
+    if ((query->commandType == CMD_UTILITY && !sh_track_utility) ||
+            query->commandType == CMD_UNKNOWN || 
+            (sh_track_utility && query->utilityStmt && !SH_VALID_UTILSTMT(query->utilityStmt)))
+        stmt_data.to_store = false;
+    else if (sh_track_utility && query->utilityStmt && SH_VALID_UTILSTMT(query->utilityStmt))
+    {
+        query->queryId = UINT64CONST(0);
+        stmt_data.to_store = true;
+    }
+    else
+        stmt_data.to_store = true;
+        
+        
+    
+    stmt_data.fd_shinternal.queryid = query->queryId;
+
+    INSTR_TIME_SET_CURRENT(stmt_data.rewrite_step.end);
+
+    INSTR_TIME_SUBTRACT(stmt_data.rewrite_step.end, stmt_data.rewrite_step.start);
+    stmt_data.fd_shinternal.rewrite_time = INSTR_TIME_GET_MICROSEC(stmt_data.rewrite_step.end);
+
+    
+}
+
+static PlannedStmt *
+sh_planner(Query *parse,
+           const char *query_string,
+		   int cursorOptions,
+		   ParamListInfo boundParams)
+{
+    PlannedStmt *result;
+
+    INSTR_TIME_SET_CURRENT(stmt_data.plan_step.start);
+
+    if (prev_planner_hook)
+        result = prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+    else
+        result = standard_planner(parse, query_string, cursorOptions, boundParams);
+
+    return result;
+}
+
+static void
+sh_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+    INSTR_TIME_SET_CURRENT(stmt_data.plan_step.end);
+    INSTR_TIME_SUBTRACT(stmt_data.plan_step.end, stmt_data.plan_step.start);
+    stmt_data.fd_shinternal.plan_time = INSTR_TIME_GET_MICROSEC(stmt_data.plan_step.end);
+
+    INSTR_TIME_SET_CURRENT(stmt_data.exec_step.start);
+    if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+sh_ExecutorRun(QueryDesc *queryDesc,
+			   ScanDirection direction,
+			   uint64 count,
+			   bool execute_once)
+{
+    if (prev_ExecutorRun)
+		prev_ExecutorRun(queryDesc, direction, count, execute_once);
+	else
+		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+}
+
+static void
+sh_ExecutorFinish(QueryDesc *queryDesc)
+{
+    if (prev_ExecutorFinish)
+		prev_ExecutorFinish(queryDesc);
+	else
+		standard_ExecutorFinish(queryDesc);
+}
+
+static void
+sh_ExecutorEnd(QueryDesc *queryDesc)
+{
+    if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+
+    INSTR_TIME_SET_CURRENT(stmt_data.exec_step.end);
+    INSTR_TIME_SUBTRACT(stmt_data.exec_step.end, stmt_data.exec_step.start);
+    stmt_data.fd_shinternal.exec_time = INSTR_TIME_GET_MICROSEC(stmt_data.exec_step.end);
+
+    sh_writedata();
+}
+
+static void
+sh_writedata(void)
+{
+    Relation	rel_stmthist;
+    HeapTuple   shtup;
+    LocalPgBackendStatus *local_beentry;
+	PgBackendStatus *beentry;
+    Datum       values[Natts_stmt_hist_internal];
+    bool        nulls[Natts_stmt_hist_internal];
+
+    if (!stmt_data.to_store)
+        return;
+
+
+    if (stmt_hist_internal_rel == InvalidOid)
+    {
+        Relation    rel_class;
+        TableScanDesc rc_scan;
+	    HeapTuple	rc_tup;
+
+        rel_class = table_open(RelationRelationId, AccessShareLock);
+	    rc_scan = table_beginscan_catalog(rel_class, 0, NULL);
+
+	    while ((rc_tup = heap_getnext(rc_scan, ForwardScanDirection)) != NULL)
+	    {
+		    Form_pg_class rcForm = (Form_pg_class) GETSTRUCT(rc_tup);
+
+            if (rcForm->relnamespace == SH_INTERNAL_TABNS &&
+                    strcasecmp(rcForm->relname.data, SH_INTERNAL_TABLE) == 0)
+            {
+                stmt_hist_internal_rel = rcForm->oid;
+
+                Assert(stmt_hist_internal_rel != InvalidOid);
+
+                break;
+            }
+	    }
+
+	    table_endscan(rc_scan);
+	    table_close(rel_class, AccessShareLock);
+    }
+
+    local_beentry = pgstat_get_local_beentry_by_proc_number(MyProcNumber);
+    beentry  = &local_beentry->backendStatus;
+
+    values[Anum_stmt_hist_internal_datid - 1] = ObjectIdGetDatum(MyDatabaseId);
+    nulls[Anum_stmt_hist_internal_datid - 1] = false;
+
+    values[Anum_stmt_hist_internal_userid - 1] = Int32GetDatum(beentry->st_userid);
+    nulls[Anum_stmt_hist_internal_userid - 1] = false;
+
+    values[Anum_stmt_hist_internal_nspid - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_nspid - 1] = true;
+
+    if (strcmp(beentry->st_appname, "") == 0)
+    {
+        values[Anum_stmt_hist_internal_application_name - 1] = (Datum) 0;
+        nulls[Anum_stmt_hist_internal_application_name - 1] = true;
+    }
+    else
+    {
+        values[Anum_stmt_hist_internal_application_name - 1] = PointerGetDatum(cstring_to_text(beentry->st_appname));
+        nulls[Anum_stmt_hist_internal_application_name - 1] = false;
+    }
+    
+    if (strcmp(beentry->st_clienthostname, "") == 0)
+    {
+        values[Anum_stmt_hist_internal_client_addr - 1] = (Datum) 0;
+        nulls[Anum_stmt_hist_internal_client_addr - 1] = true;
+    }
+    else
+    {
+        values[Anum_stmt_hist_internal_client_addr - 1] = PointerGetDatum(cstring_to_text(beentry->st_clienthostname));
+        nulls[Anum_stmt_hist_internal_client_addr - 1] = false;
+    }
+    
+
+    values[Anum_stmt_hist_internal_client_port - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_client_port - 1] = true;
+
+    if (strcmp(stmt_data.fd_shinternal.query_string, "") == 0)
+    {
+        values[Anum_stmt_hist_internal_query_string - 1] = (Datum) 0;
+        nulls[Anum_stmt_hist_internal_query_string - 1] = true;
+    }
+    else
+    {
+        values[Anum_stmt_hist_internal_query_string - 1] = PointerGetDatum(cstring_to_text(stmt_data.fd_shinternal.query_string));
+        nulls[Anum_stmt_hist_internal_query_string - 1] = false;
+    }
+
+    values[Anum_stmt_hist_internal_queryid - 1] = Int64GetDatum(stmt_data.fd_shinternal.queryid);
+    nulls[Anum_stmt_hist_internal_queryid - 1] = false;
+
+    values[Anum_stmt_hist_internal_start_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_start_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_finish_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_finish_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_processid - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_processid - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_soft_parse - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_soft_parse - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_hard_parse - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_hard_parse - 1] = true;
+
+    values[Anum_stmt_hist_internal_query_plan - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_query_plan - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_returned_rows - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_returned_rows - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_tuples_fetched - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_tuples_fetched - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_tuples_returned - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_tuples_returned - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_tuples_inserted - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_tuples_inserted - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_tuples_updated - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_tuples_updated - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_tuples_deleted - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_tuples_deleted - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_blocks_fetched - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_blocks_fetched - 1] = true;
+
+    values[Anum_stmt_hist_internal_n_blocks_hit - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_n_blocks_hit - 1] = true;
+
+    values[Anum_stmt_hist_internal_db_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_db_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_cpu_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_cpu_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_io_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_io_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_parse_time - 1] = Int64GetDatum(stmt_data.fd_shinternal.parse_time);
+    nulls[Anum_stmt_hist_internal_parse_time - 1] = false;
+
+    values[Anum_stmt_hist_internal_rewrite_time - 1] = Int64GetDatum(stmt_data.fd_shinternal.rewrite_time);
+    nulls[Anum_stmt_hist_internal_rewrite_time - 1] = false;
+
+    values[Anum_stmt_hist_internal_plan_time - 1] = Int64GetDatum(stmt_data.fd_shinternal.plan_time);
+    nulls[Anum_stmt_hist_internal_plan_time - 1] = false;
+
+    values[Anum_stmt_hist_internal_exec_time - 1] = Int64GetDatum(stmt_data.fd_shinternal.exec_time);
+    nulls[Anum_stmt_hist_internal_exec_time - 1] = false;
+
+    values[Anum_stmt_hist_internal_lock_count - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lock_count - 1] = true;
+
+    values[Anum_stmt_hist_internal_lock_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lock_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_lock_wait_count - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lock_wait_count - 1] = true;
+
+    values[Anum_stmt_hist_internal_lock_wait_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lock_wait_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_lock_max_count - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lock_max_count - 1] = true;
+
+    values[Anum_stmt_hist_internal_lwlock_count - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lwlock_count] = true;
+
+    values[Anum_stmt_hist_internal_lwlock_wait_count - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lwlock_wait_count - 1] = true;
+
+    values[Anum_stmt_hist_internal_lwlock_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lwlock_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_lwlock_wait_time - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_lwlock_wait_time - 1] = true;
+
+    values[Anum_stmt_hist_internal_wait_event - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_wait_event - 1] = true;
+
+    values[Anum_stmt_hist_internal_is_slow_sql - 1] = (Datum) 0;
+    nulls[Anum_stmt_hist_internal_is_slow_sql - 1] = true;
+
+    rel_stmthist = table_open(stmt_hist_internal_rel, NoLock);
+    shtup = heap_form_tuple(RelationGetDescr(rel_stmthist), values, nulls);
+    CatalogTupleInsert(rel_stmthist, shtup);
+    table_close(rel_stmthist, NoLock);
 }
