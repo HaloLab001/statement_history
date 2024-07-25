@@ -178,4 +178,23 @@ typedef struct SHDataInternalData
     bool                        to_store;
 } SHDataInternalData;
 
+typedef enum lock_stat_type
+{
+    LOCK_STATISC_NOWAIT = 0,
+    LOCK_STATISC_WAITTING
+} lock_stat_type;
+
+typedef struct lock_statis
+{
+    /* for lock */
+    instr_time lock_time;
+    instr_time lock_wttime;
+    uint32 recursion;           // 大于等于2，说明开始递归
+
+    /* for lwlock */
+    instr_time lwlock_time;
+    instr_time lwlock_wttime;
+    uint32  lwlock_stat;
+} lock_statis;
+
 #endif							/* STMT_HIST_H */

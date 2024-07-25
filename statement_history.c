@@ -69,12 +69,15 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
+#include "storage/lock.h"
+#include "storage/lwlock.h"
 
 /* GUC parameters*/
 static bool sh_track_utility = true;	/* whether to track utility commands */
 
 static SHDataInternalData   stmt_data;
 static Oid  stmt_hist_internal_rel = InvalidOid;
+static lock_statis lock_statis_data;
 
 static pre_parse_hook_type  prev_pre_parse_hook = NULL;
 static post_parse_hook_type prev_post_parse_hook = NULL;
@@ -86,6 +89,14 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
+// lock_statisc_func_type lock_statis_hook = NULL;
+// lock_statisc_end_type lock_statis_end_hook = NULL;
+// lock_statisc_wait_type lock_statis_wait_hook = NULL;
+// lock_statisc_wait_end_type lock_statis_wait_end_hook = NULL;
+
+// static LWLock_statisc_hook_type lwlock_statisc_hook = NULL;
+// static LWLock_statisc_end_type lwlock_statisc_end_hook = NULL;
+// static LWLock_statisc_wait_type lwlock_statisc_wait_hook = NULL;
 
 #define SH_INTERNAL_TABLE   "statement_history_internal"
 #define SH_INTERNAL_TABNS  PG_CATALOG_NAMESPACE
@@ -110,6 +121,15 @@ static void sh_ExecutorRun(QueryDesc *queryDesc,
 static void sh_ExecutorFinish(QueryDesc *queryDesc);
 static void sh_ExecutorEnd(QueryDesc *queryDesc);
 static void sh_writedata(void);
+
+static void statmh_lock_statisc_begin();
+static void lock_statisc_begin();
+static void lock_statisc_end();
+static void lock_statisc_wait();
+static void lock_statisc_wait_end();
+static void lwlock_statisc_begin();
+static void lwlock_statisc_end();
+static void lwlock_statisc_wait();
 
 PG_MODULE_MAGIC;
 
@@ -165,8 +185,16 @@ _PG_init(void)
 	ExecutorFinish_hook = sh_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = sh_ExecutorEnd;
-}
 
+    lock_statis_hook = lock_statisc_begin;
+    lock_statis_end_hook = lock_statisc_end;
+    lock_statis_wait_hook = lock_statisc_wait;
+    lock_statis_wait_end_hook = lock_statisc_wait_end;
+
+    lwlock_statisc_hook = lwlock_statisc_begin;
+    lwlock_statisc_end_hook = lwlock_statisc_end;
+    lwlock_statisc_wait_hook = lwlock_statisc_wait;
+}
 
 static void 
 sh_pre_parse(const char *str, RawParseMode mode)
@@ -501,4 +529,140 @@ sh_writedata(void)
     shtup = heap_form_tuple(RelationGetDescr(rel_stmthist), values, nulls);
     CatalogTupleInsert(rel_stmthist, shtup);
     table_close(rel_stmthist, NoLock);
+}
+
+/*
+    run at SQL startted. When sql finished, no function have to run.
+*/
+static void 
+statmh_lock_statisc_begin()
+{
+    /* for lock */
+    stmt_data.fd_shinternal.lock_count = 0;
+    stmt_data.fd_shinternal.lock_wait_count = 0;
+    stmt_data.fd_shinternal.lock_time = 0;
+    stmt_data.fd_shinternal.lock_wait_time = 0;
+
+    INSTR_TIME_SET_ZERO(lock_statis_data.lock_time);
+    INSTR_TIME_SET_ZERO(lock_statis_data.lock_wttime);
+    lock_statis_data.recursion = 0;
+
+    /* for lwlock */
+    stmt_data.fd_shinternal.lwlock_count = 0;
+    stmt_data.fd_shinternal.lwlock_wait_count = 0;
+    stmt_data.fd_shinternal.lwlock_time = 0;
+    stmt_data.fd_shinternal.lwlock_wait_time = 0;
+
+    INSTR_TIME_SET_ZERO(lock_statis_data.lwlock_time);
+    INSTR_TIME_SET_ZERO(lock_statis_data.lwlock_wttime);
+    lock_statis_data.lwlock_stat = LOCK_STATISC_NOWAIT;
+
+    return ;
+}
+
+/* lock */
+static void
+lock_statisc_begin()
+{
+    stmt_data.fd_shinternal.lock_count++;          // lock gets ++
+    lock_statis_data.recursion ++;
+
+    if (lock_statis_data.recursion <= 1)
+    {
+        INSTR_TIME_SET_CURRENT(lock_statis_data.lock_time);
+    }
+}
+
+static void
+lock_statisc_end()
+{
+    instr_time      duration;
+    TimestampTz     tm;
+
+    if (lock_statis_data.recursion <= 1)
+    {
+        INSTR_TIME_SET_CURRENT(duration);
+        INSTR_TIME_SUBTRACT(duration, lock_statis_data.lock_time);
+        tm = INSTR_TIME_GET_MICROSEC(duration);
+        stmt_data.fd_shinternal.lock_time += tm;
+    }
+
+    lock_statis_data.recursion --;
+
+    return ;
+}
+
+static void
+lock_statisc_wait()
+{
+    stmt_data.fd_shinternal.lock_wait_count++;          // lock gets ++
+    INSTR_TIME_SET_CURRENT(lock_statis_data.lock_wttime);
+}
+
+static void
+lock_statisc_wait_end()
+{
+    instr_time      duration;
+    TimestampTz     tm;
+
+    INSTR_TIME_SET_CURRENT(duration);
+    INSTR_TIME_SUBTRACT(duration, lock_statis_data.lock_wttime);
+    tm = INSTR_TIME_GET_MICROSEC(duration);
+    stmt_data.fd_shinternal.lock_wait_time += tm;
+
+    return ;
+}
+
+/* LWLock */
+static void
+lwlock_statisc_begin()
+{
+    instr_time      duration;
+    TimestampTz     tm;
+
+    stmt_data.fd_shinternal.lwlock_count++;          // LWLock gets ++
+    INSTR_TIME_SET_CURRENT(lock_statis_data.lwlock_time);
+
+    /* Happy Path */
+    if (lock_statis_data.lwlock_stat != LOCK_STATISC_WAITTING)
+    {
+        return ;
+    }
+
+    /* 计算LWLock等待时间 */
+    INSTR_TIME_SET_CURRENT(duration);
+    INSTR_TIME_SUBTRACT(duration, lock_statis_data.lwlock_wttime);
+    tm = INSTR_TIME_GET_MICROSEC(duration);
+    stmt_data.fd_shinternal.lwlock_wait_time += tm;
+    lock_statis_data.lwlock_stat = LOCK_STATISC_NOWAIT;
+    INSTR_TIME_SET_ZERO(lock_statis_data.lwlock_wttime);    // 等待状态设为LOCK_STATISC_NOWAIT时，lwlock_wttime必须清0。
+}
+
+static void
+lwlock_statisc_end()
+{
+    instr_time      duration;
+    TimestampTz     tm;
+
+    INSTR_TIME_SET_CURRENT(duration);
+    INSTR_TIME_SUBTRACT(duration, lock_statis_data.lwlock_time);
+    tm = INSTR_TIME_GET_MICROSEC(duration);
+    stmt_data.fd_shinternal.lwlock_time += tm;
+
+    /* 恢复原始值 */
+    INSTR_TIME_SET_ZERO(lock_statis_data.lwlock_time);
+    INSTR_TIME_SET_ZERO(lock_statis_data.lwlock_wttime);
+    lock_statis_data.lwlock_stat = LOCK_STATISC_NOWAIT;
+}
+
+static void
+lwlock_statisc_wait()
+{
+    /* 一次加锁尝试结束，开始等待。等待被唤醒后，会再次进入加锁函数 */
+    lwlock_statisc_end();
+
+    stmt_data.fd_shinternal.lwlock_wait_count++;          // LWLock wait ++
+
+    lock_statis_data.lwlock_stat = LOCK_STATISC_WAITTING;
+    INSTR_TIME_SET_CURRENT(lock_statis_data.lwlock_wttime);
 }
